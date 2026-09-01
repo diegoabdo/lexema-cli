@@ -4,7 +4,7 @@
 
 SCRIPTS := scripts
 
-.PHONY: help install env server up use-local build cli ask chat models config typecheck lint test demo clean deploy
+.PHONY: help install env server up use-local use-lan build compile cli ask chat models config typecheck lint test demo clean deploy
 
 help: ## Lista los comandos disponibles
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -34,8 +34,15 @@ use-local: ## Apunta la CLI al servidor local (URL + token del .env)
 	if [ -n "$$TOKEN" ]; then node cli/dist/index.mjs config set-token "$$TOKEN"; \
 	else echo "Sin CLIENT_TOKEN en .env (endpoint abierto)"; fi
 
+use-lan: ## Detecta las IPs de esta máquina y elegí cuál usa la CLI (para probar desde otro dispositivo)
+	@test -d cli/dist || $(MAKE) build
+	@node $(SCRIPTS)/select-lan-ip.mjs
+
 build: ## Compila la CLI (cli/dist)
 	@cd cli && npm run build
+
+compile: ## Genera el binario standalone (cli/dist-bin) preguntando IP/puerto, para probar en otra VM
+	@node $(SCRIPTS)/compile.mjs
 
 cli: ## Corre la CLI local: make cli CMD="models"
 	@test -d cli/dist || $(MAKE) build
