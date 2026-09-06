@@ -244,7 +244,7 @@ function main(): void {
     console.log(`API key: ${cfg.apiKey ? 'configurada' : pcRed('FALTA (revisa tu .env)')}`);
     console.log(`Auth (CLIENT_TOKEN): ${cfg.clientToken ? 'activada' : 'desactivada'}`);
     console.log(
-      `Endpoints: POST /  ·  GET /models  ·  GET /health  ·  GET /download  ·  GET /install  ·  GET /uninstall  ·  GET /uninstall.ps1`
+      `Endpoints: POST / (chat)  ·  GET / (landing)  ·  GET /models  ·  GET /health  ·  GET /download  ·  GET /install  ·  GET /uninstall  ·  GET /uninstall.ps1`
     );
     console.log(
       `Updater: linux -> ${UPDATER_FILES.linux}  ·  win32 -> ${UPDATER_FILES.win32}  ·  fallback -> ${FALLBACK_UPDATER}`

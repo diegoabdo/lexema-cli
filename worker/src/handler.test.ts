@@ -263,6 +263,52 @@ describe('GET /download', () => {
   });
 });
 
+describe('GET / (landing)', () => {
+  it('devuelve HTML con los comandos de instalación del origin del request', async () => {
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), baseConfig());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    const html = await res.text();
+    expect(html).toContain('<!DOCTYPE html>');
+    expect(html).toContain('curl -fsSL http://mi-vm:8787/install | sh');
+    expect(html).toContain('irm http://mi-vm:8787/install.ps1 | iex');
+  });
+
+  it('es pública: responde 200 incluso con CLIENT_TOKEN activo (sin Bearer)', async () => {
+    const cfg = baseConfig({ clientToken: 'secreto' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    expect(res.status).toBe(200);
+  });
+
+  it('sin CLIENT_TOKEN los comandos no llevan header de Authorization', async () => {
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), baseConfig());
+    const html = await res.text();
+    expect(html).not.toContain('Authorization');
+  });
+
+  it('con CLIENT_TOKEN los one-liners embeben el header (curl e irm)', async () => {
+    const cfg = baseConfig({ clientToken: 'secreto' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    const html = await res.text();
+    expect(html).toContain('curl -fsSL -H &quot;Authorization: Bearer secreto&quot; http://mi-vm:8787/install | sh');
+    expect(html).toContain("irm http://mi-vm:8787/install.ps1 -Headers @{Authorization='Bearer secreto'} | iex");
+  });
+
+  it('escapa caracteres HTML del token (anti HTML-injection en la página)', async () => {
+    const cfg = baseConfig({ clientToken: 'x<y>&z' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    const html = await res.text();
+    expect(html).toContain('Bearer x&lt;y&gt;&amp;z');
+    expect(html).not.toContain('Bearer x<y>');
+  });
+
+  it('/index.html es alias de /', async () => {
+    const res = await handleRequest(new Request('http://localhost:8787/index.html'), baseConfig());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+  });
+});
+
 describe('GET /install', () => {
   const binarySource = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), filename: 'lexema' });
   // sha256 de un único byte 0x01, para verificar el hash embebido.

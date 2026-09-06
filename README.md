@@ -147,8 +147,29 @@ Distribuir el servidor es literalmente repartir ese archivo:
 
 El servidor local carga `.dev.vars` y luego `.env` (este último gana);
 `ENV_FILE=otro-archivo` para apuntar a otro. Endpoints expuestos:
-`POST /` (chat), `GET /models`, `GET /health`, `GET /download` (updater)
-y `GET /install` (instalador de la CLI).
+`POST /` (chat), `GET /` (landing page pública), `GET /models`, `GET /health`,
+`GET /download` (updater) y `GET /install` (instalador de la CLI).
+
+### Landing page en el propio servidor (GET /)
+
+El mismo servidor sirve una página web pública en la raíz
+(`http://<ip-vm>:8787/`) con la misma estética del proyecto: qué es Lexema,
+quién la hizo, su objetivo, la API que expone y — lo principal — los
+comandos de instalación para **Linux y Windows con botón de copiar**
+(un solo copy-paste). No requiere configuración:
+
+- Es **pública a propósito**: va antes del check de `CLIENT_TOKEN` porque
+  un navegador no puede mandar el Bearer header.
+- Los comandos se generan por pedido con el origin real del request
+  (igual que los scripts de `/install`), así funcionan por cualquier
+  IP/dominio/puerto por el que se llegue al servidor.
+- Si hay `CLIENT_TOKEN`, el one-liner mostrado ya lleva el header
+  embebido — ojo: eso hace el token visible para cualquiera que visite
+  la página. Si el servidor es público, la protección real es el
+  `DAILY_LIMIT`.
+- El botón de copiar usa `navigator.clipboard` con fallback a
+  `execCommand('copy')`, porque la página suele servirse por HTTP plano
+  (sin contexto seguro) desde una VM.
 
 ### Instalar la CLI desde el servidor (curl | sh)
 
@@ -235,6 +256,8 @@ git push -u origin main
 
 La distribución es autoalojada: el mismo server sirve los binarios que
 compila `make compile` y genera el instalador según el OS de quien la pida.
+La landing de `GET /` (ver arriba) ya muestra estos comandos con botón de
+copiar para que instalar sea un solo paste.
 
 ```bash
 # Linux (autodetecta x64/arm64)

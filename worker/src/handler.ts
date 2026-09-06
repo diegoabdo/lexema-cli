@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { ResolvedConfig } from './config';
 import { getProvider } from './ai';
 import { ProviderError } from './ai/types';
+import { buildLandingHtml } from './landing';
 
 export interface KVLike {
   get(key: string): Promise<string | null>;
@@ -281,6 +282,25 @@ export async function handleRequest(
   }
 
   const path = new URL(request.url).pathname.replace(/\/+$/, '') || '/';
+
+  // Landing page (GET /): pública a propósito y por eso va ANTES del check
+  // del CLIENT_TOKEN — un navegador no puede mandar el Bearer token de la
+  // API, y la página es la puerta de entrada (qué es, quién la hizo, cómo
+  // instalar con un copy-paste). Los comandos que muestra se generan con el
+  // origin real del request, igual que los scripts de /install.
+  if (request.method === 'GET' && (path === '/' || path === '/index.html')) {
+    return new Response(
+      buildLandingHtml({ origin: new URL(request.url).origin, token: cfg.clientToken }),
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          ...corsHeaders(),
+        },
+      }
+    );
+  }
 
   // Autenticación simple por token compartido (opcional pero recomendado).
   // Va antes de los GET: si no, /health y /models exponen el proveedor, el
