@@ -2,6 +2,8 @@
 import { Command } from 'commander';
 import pc from 'picocolors';
 import * as readline from 'node:readline';
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { render } from 'ink';
 import App from './tui/App';
 import {
@@ -11,6 +13,7 @@ import {
   buildConversationPrompt,
   ChatTurn,
 } from './api';
+import { parseSlashCommand } from './commands';
 import type { ChildProcess } from 'node:child_process';
 import {
   downloadUpdateFile,
@@ -22,6 +25,7 @@ import {
   UPDATER_INTERVAL_MS,
 } from './updater';
 import { loadConfig, saveConfig } from './config';
+import { resolveBinaryPath, resolveConfigDir, binaryExists } from './uninstaller';
 
 const VERSION = '1.0.2'; // mantenla en sincronía con package.json
 
@@ -205,12 +209,13 @@ async function runSimpleChat() {
   for await (const raw of rl) {
     const text = raw.trim();
     const lower = text.toLowerCase();
-    if (lower === 'exit' || text === '/exit') break;
+    const { cmd } = parseSlashCommand(text);
+    if (lower === 'exit' || cmd === '/exit') break;
     if (!text) {
       safePrompt();
       continue;
     }
-    if (text === '/clear') {
+    if (cmd === '/clear') {
       // Limpia la pantalla real, no solo el historial en memoria, para que
       // "/clear" se sienta como un clear de verdad.
       process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
@@ -220,7 +225,7 @@ async function runSimpleChat() {
       safePrompt();
       continue;
     }
-    if (text === '/help') {
+    if (cmd === '/help') {
       console.log(pc.dim('Comandos: /clear · /help · /exit'));
       safePrompt();
       continue;
@@ -287,6 +292,68 @@ program
   .action(async () => {
     updaterDone ??= runUpdaterFlow(true);
     await updaterDone;
+  });
+
+// Pregunta s/N por stdin. Se usa tanto para confirmar el borrado del
+// binario como el de ~/.lexema (por separado, cada uno con su propio
+// riesgo: perder la config no es lo mismo que perder el binario).
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(/^(s|si|sí|y|yes)$/i.test(answer.trim()));
+    });
+  });
+}
+
+program
+  .command('uninstall')
+  .description('Desinstala Lexema CLI del sistema')
+  .option('-y, --yes', 'No pedir confirmación para borrar el binario (no borra ~/.lexema salvo --purge)')
+  .option('--purge', 'También borra ~/.lexema (configuración y updates), sin preguntar')
+  .action(async (opts: { yes?: boolean; purge?: boolean }) => {
+    const binPath = resolveBinaryPath();
+    if (!binaryExists(binPath)) {
+      console.log(pc.yellow(`⚠ No se encontró Lexema CLI instalado en ${binPath}`));
+    } else {
+      const proceed = opts.yes || (await confirm(pc.dim(`¿Borrar ${binPath}? (s/N) `)));
+      if (!proceed) {
+        console.log(pc.dim('Cancelado.'));
+      } else {
+        try {
+          fs.unlinkSync(binPath);
+          console.log(pc.green(`✔ Lexema CLI desinstalado (${binPath})`));
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'EACCES' || code === 'EPERM') {
+            try {
+              console.log(pc.dim(`Se requieren permisos de administrador para borrar ${binPath}`));
+              execFileSync('sudo', ['rm', '-f', binPath], { stdio: 'inherit' });
+              console.log(pc.green(`✔ Lexema CLI desinstalado (${binPath})`));
+            } catch {
+              console.log(pc.red(`✖ No se pudo borrar ${binPath}.`));
+              process.exitCode = 1;
+            }
+          } else {
+            console.log(pc.red(`✖ No se pudo borrar ${binPath}: ${(err as Error).message}`));
+            process.exitCode = 1;
+          }
+        }
+      }
+    }
+
+    const configDir = resolveConfigDir();
+    if (fs.existsSync(configDir)) {
+      const purge =
+        opts.purge || (!opts.yes && (await confirm(pc.dim(`¿Borrar también ${configDir}? (s/N) `))));
+      if (purge) {
+        fs.rmSync(configDir, { recursive: true, force: true });
+        console.log(pc.green(`✔ Configuración borrada (${configDir})`));
+      } else {
+        console.log(pc.dim(`Configuración conservada en ${configDir}`));
+      }
+    }
   });
 
 const configCmd = program.command('config').description('Configura la CLI');

@@ -17,6 +17,7 @@ function baseConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
     clientToken: undefined,
     maxPromptLength: 4000,
     dailyLimit: 100,
+    aiTimeoutMs: 30000,
     ...overrides,
   };
 }
@@ -99,6 +100,44 @@ describe('handleRequest', () => {
     expect(res.status).toBe(200);
   });
 
+  it('token de distinta longitud al esperado devuelve 401 (sin comparar byte a byte)', async () => {
+    const cfg = baseConfig({ clientToken: 'secret' });
+    const res = await handleRequest(
+      postRequest({ prompt: 'hola' }, { Authorization: 'Bearer sec' }),
+      cfg
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('token con la misma longitud pero distinto contenido devuelve 401', async () => {
+    const cfg = baseConfig({ clientToken: 'secret' });
+    const res = await handleRequest(
+      postRequest({ prompt: 'hola' }, { Authorization: 'Bearer zzzzzz' }),
+      cfg
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('el rate limit usa x-lexema-real-ip, no CF-Connecting-IP (no es spoofeable por el cliente)', async () => {
+    const cfg = baseConfig({ dailyLimit: 1 });
+    const kv = new MemoryKV();
+    getProvider.mockReturnValue({ provider: { complete: vi.fn().mockResolvedValue('ok') } });
+    // Dos IPs de CF-Connecting-IP distintas mandadas por el "cliente", pero
+    // ambos requests comparten la misma x-lexema-real-ip real: deben
+    // compartir el mismo contador y el segundo debe ser limitado.
+    await handleRequest(
+      postRequest({ prompt: 'uno' }, { 'CF-Connecting-IP': '1.1.1.1', 'x-lexema-real-ip': '9.9.9.9' }),
+      cfg,
+      kv
+    );
+    const res = await handleRequest(
+      postRequest({ prompt: 'dos' }, { 'CF-Connecting-IP': '2.2.2.2', 'x-lexema-real-ip': '9.9.9.9' }),
+      cfg,
+      kv
+    );
+    expect(res.status).toBe(429);
+  });
+
   it('supera el límite diario del KV -> 429', async () => {
     const cfg = baseConfig({ dailyLimit: 1 });
     const kv = new MemoryKV();
@@ -152,6 +191,7 @@ describe('handleRequest', () => {
       apiKey: 'sk-test',
       baseUrl: 'https://api.example.com',
       systemPrompt: undefined,
+      timeoutMs: 30000,
     });
   });
 
@@ -220,5 +260,340 @@ describe('GET /download', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('GET / (landing)', () => {
+  it('devuelve HTML con los comandos de instalación del origin del request', async () => {
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), baseConfig());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    const html = await res.text();
+    expect(html).toContain('<!DOCTYPE html>');
+    expect(html).toContain('curl -fsSL http://mi-vm:8787/install | sh');
+    expect(html).toContain('irm http://mi-vm:8787/install.ps1 | iex');
+  });
+
+  it('es pública: responde 200 incluso con CLIENT_TOKEN activo (sin Bearer)', async () => {
+    const cfg = baseConfig({ clientToken: 'secreto' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    expect(res.status).toBe(200);
+  });
+
+  it('sin CLIENT_TOKEN los comandos no llevan header de Authorization', async () => {
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), baseConfig());
+    const html = await res.text();
+    expect(html).not.toContain('Authorization');
+  });
+
+  it('con CLIENT_TOKEN los one-liners embeben el header (curl e irm)', async () => {
+    const cfg = baseConfig({ clientToken: 'secreto' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    const html = await res.text();
+    expect(html).toContain('curl -fsSL -H &quot;Authorization: Bearer secreto&quot; http://mi-vm:8787/install | sh');
+    expect(html).toContain("irm http://mi-vm:8787/install.ps1 -Headers @{Authorization='Bearer secreto'} | iex");
+  });
+
+  it('escapa caracteres HTML del token (anti HTML-injection en la página)', async () => {
+    const cfg = baseConfig({ clientToken: 'x<y>&z' });
+    const res = await handleRequest(new Request('http://mi-vm:8787/'), cfg);
+    const html = await res.text();
+    expect(html).toContain('Bearer x&lt;y&gt;&amp;z');
+    expect(html).not.toContain('Bearer x<y>');
+  });
+
+  it('/index.html es alias de /', async () => {
+    const res = await handleRequest(new Request('http://localhost:8787/index.html'), baseConfig());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+  });
+});
+
+describe('GET /install', () => {
+  const binarySource = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), filename: 'lexema' });
+  // sha256 de un único byte 0x01, para verificar el hash embebido.
+  const SHA256_OF_BYTE_1 = '4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a';
+
+  it('sin binario en el servidor devuelve 404', async () => {
+    const res = await handleRequest(new Request('http://localhost/install'), baseConfig());
+    expect(res.status).toBe(404);
+  });
+
+  it('devuelve el script sh con la URL del servidor embebida', async () => {
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('shellscript');
+    const script = await res.text();
+    expect(script).toContain('SERVER="http://mi-vm:8787"');
+    expect(script).toContain('Linux-x86_64) OS="linux-x64"');
+    expect(script).toContain('$SERVER/install/binary?os=$OS');
+    expect(script).not.toContain('Authorization');
+  });
+
+  it('descarga el binario mostrando progreso (sin -s en curl, con --show-progress en wget)', async () => {
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource
+    );
+    const script = await res.text();
+    expect(script).toContain('curl -fSL -o "$2" "$1"');
+    expect(script).not.toContain('-fsSL -o "$2" "$1"');
+    expect(script).toContain('wget --show-progress -O "$2" "$1"');
+    expect(script).not.toContain('wget -q');
+  });
+
+  it('embebe el checksum SHA-256 del binario y verifica antes de instalar', async () => {
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource
+    );
+    const script = await res.text();
+    expect(script).toContain(`linux-x64) EXPECTED_SHA256="${SHA256_OF_BYTE_1}"`);
+    expect(script).toContain(`linux-arm64) EXPECTED_SHA256="${SHA256_OF_BYTE_1}"`);
+    expect(script).toContain('sha256sum');
+    expect(script).toContain('shasum -a 256');
+    expect(script).toContain('Verificación de integridad fallida');
+    expect(script).toContain('exit 1');
+  });
+
+  it('con CLIENT_TOKEN embebe el header en el script', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/install', {
+        headers: { Authorization: 'Bearer secreto' },
+      }),
+      baseConfig({ clientToken: 'secreto' }),
+      undefined,
+      undefined,
+      binarySource
+    );
+    const script = await res.text();
+    expect(script).toContain('Authorization: Bearer secreto');
+  });
+
+  it('usa el hash de installHash (cacheado) en vez de recalcularlo de los bytes', async () => {
+    const installHash = vi.fn().mockResolvedValue('hash-cacheado');
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource,
+      installHash
+    );
+    const script = await res.text();
+    expect(installHash).toHaveBeenCalledWith('linux-x64');
+    expect(installHash).toHaveBeenCalledWith('linux-arm64');
+    expect(script).toContain('linux-x64) EXPECTED_SHA256="hash-cacheado"');
+    expect(script).toContain('linux-arm64) EXPECTED_SHA256="hash-cacheado"');
+  });
+
+  it('si installHash devuelve null, cae a calcular el hash de los bytes', async () => {
+    const installHash = vi.fn().mockResolvedValue(null);
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource,
+      installHash
+    );
+    const script = await res.text();
+    expect(script).toContain(`linux-x64) EXPECTED_SHA256="${SHA256_OF_BYTE_1}"`);
+  });
+
+  it('/install.sh es alias de /install', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/install.sh'),
+      baseConfig(),
+      undefined,
+      undefined,
+      binarySource
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('GET /install.ps1', () => {
+  const winSource = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), filename: 'lexema.exe' });
+
+  it('sin binario de Windows devuelve 404', async () => {
+    const res = await handleRequest(new Request('http://localhost/install.ps1'), baseConfig());
+    expect(res.status).toBe(404);
+  });
+
+  it('devuelve el script PowerShell apuntando al binario de Windows', async () => {
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install.ps1'),
+      baseConfig(),
+      undefined,
+      undefined,
+      winSource
+    );
+    expect(res.status).toBe(200);
+    expect(winSource).toHaveBeenCalledWith('windows-x64');
+    const script = await res.text();
+    expect(script).toContain('$Server = "http://mi-vm:8787"');
+    expect(script).toContain('install/binary?os=windows-x64');
+    expect(script).not.toContain('Authorization');
+  });
+
+  it('usa el hash de installHash para windows-x64 en vez de recalcularlo', async () => {
+    const installHash = vi.fn().mockResolvedValue('hash-win-cacheado');
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install.ps1'),
+      baseConfig(),
+      undefined,
+      undefined,
+      winSource,
+      installHash
+    );
+    const script = await res.text();
+    expect(installHash).toHaveBeenCalledWith('windows-x64');
+    expect(script).toContain('$ExpectedSha256 = "hash-win-cacheado"');
+  });
+
+  it('con CLIENT_TOKEN embebe el header en el script', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/install.ps1', {
+        headers: { Authorization: 'Bearer secreto' },
+      }),
+      baseConfig({ clientToken: 'secreto' }),
+      undefined,
+      undefined,
+      winSource
+    );
+    const script = await res.text();
+    expect(script).toContain('$headers.Authorization = "Bearer secreto"');
+  });
+
+  it('embebe el checksum SHA-256 del .exe y verifica antes de mover', async () => {
+    const res = await handleRequest(
+      new Request('http://mi-vm:8787/install.ps1'),
+      baseConfig(),
+      undefined,
+      undefined,
+      winSource
+    );
+    const script = await res.text();
+    expect(script).toContain('$ExpectedSha256 = "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"');
+    expect(script).toContain('Get-FileHash -Path $Tmp -Algorithm SHA256');
+  });
+});
+
+describe('GET /uninstall', () => {
+  it('devuelve el script sh sin depender de binarios en el servidor', async () => {
+    const res = await handleRequest(new Request('http://localhost/uninstall'), baseConfig());
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('shellscript');
+    const script = await res.text();
+    expect(script).toContain('BIN_PATH="/usr/local/bin/lexema"');
+    expect(script).toContain('rm -f "$BIN_PATH"');
+  });
+
+  it('/uninstall.sh es alias de /uninstall', async () => {
+    const res = await handleRequest(new Request('http://localhost/uninstall.sh'), baseConfig());
+    expect(res.status).toBe(200);
+  });
+
+  it('exige el CLIENT_TOKEN como el resto de endpoints', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/uninstall'),
+      baseConfig({ clientToken: 'secreto' })
+    );
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('GET /uninstall.ps1', () => {
+  it('devuelve el script PowerShell sin depender de binarios en el servidor', async () => {
+    const res = await handleRequest(new Request('http://localhost/uninstall.ps1'), baseConfig());
+    expect(res.status).toBe(200);
+    const script = await res.text();
+    expect(script).toContain('Programs\\lexema');
+    expect(script).toContain('Remove-Item -Force $Dest');
+  });
+});
+
+describe('GET /install/binary', () => {
+  it('sirve el binario del OS pedido (default linux-x64)', async () => {
+    const source = vi.fn().mockResolvedValue({ bytes: new Uint8Array([7, 8, 9]), filename: 'lexema' });
+    const res = await handleRequest(
+      new Request('http://localhost/install/binary'),
+      baseConfig(),
+      undefined,
+      undefined,
+      source
+    );
+    expect(res.status).toBe(200);
+    expect(source).toHaveBeenCalledWith('linux-x64');
+    expect(res.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(res.headers.get('Content-Disposition')).toBe('attachment; filename="lexema"');
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([7, 8, 9]));
+  });
+
+  it('?os=windows-x64 pide el binario de Windows', async () => {
+    const source = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), filename: 'lexema.exe' });
+    const res = await handleRequest(
+      new Request('http://localhost/install/binary?os=windows-x64'),
+      baseConfig(),
+      undefined,
+      undefined,
+      source
+    );
+    expect(res.status).toBe(200);
+    expect(source).toHaveBeenCalledWith('windows-x64');
+    expect(res.headers.get('Content-Disposition')).toBe('attachment; filename="lexema.exe"');
+  });
+
+  it('?os= inválido cae al default (linux-x64)', async () => {
+    const source = vi.fn().mockResolvedValue({ bytes: new Uint8Array([1]), filename: 'lexema' });
+    await handleRequest(
+      new Request('http://localhost/install/binary?os=templeos'),
+      baseConfig(),
+      undefined,
+      undefined,
+      source
+    );
+    expect(source).toHaveBeenCalledWith('linux-x64');
+  });
+
+  it('sin binario para el OS pedido devuelve 404', async () => {
+    const source = vi.fn().mockResolvedValue(null);
+    const res = await handleRequest(
+      new Request('http://localhost/install/binary?os=windows-x64'),
+      baseConfig(),
+      undefined,
+      undefined,
+      source
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('sin binario compilado devuelve 404', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/install/binary'),
+      baseConfig()
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('exige el CLIENT_TOKEN como el resto de endpoints', async () => {
+    const res = await handleRequest(
+      new Request('http://localhost/install/binary'),
+      baseConfig({ clientToken: 'secreto' })
+    );
+    expect(res.status).toBe(401);
   });
 });
